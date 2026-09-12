@@ -1,0 +1,80 @@
+name: Build Android Dev Client APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Git branch to build'
+        required: true
+        default: 'main'
+        type: string
+
+jobs:
+  build:
+    name: Build Android Dev Client APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.MASTER_REPO_PATH }}
+          token: ${{ secrets.MASTER_GITHUB_TOKEN }}
+          ref: ${{ inputs.target_branch }}
+
+      - name: 配置 Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 安装 npm 依赖
+        run: npm ci --legacy-peer-deps
+
+      - name: 提取版本号与构建信息
+        id: meta
+        run: |
+          VERSION=$(node -p "try { require('./package.json').version } catch(e) { 'unknown' }")
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          DATE=$(date +'%Y%m%d')
+          APK_NAME="NodeAuth-v${VERSION}-${COMMIT_HASH}-${DATE}-DevClient"
+          echo "APK_NAME=${APK_NAME}" >> $GITHUB_ENV
+          echo "APK 产物名称将设置为: ${APK_NAME}"
+
+      - name: 生成原生 Android 工程 (Prebuild)
+        run: npx expo prebuild --platform android --clean
+
+      - name: 配置 Gradle 缓存与运行环境
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: 编译 Debug DevClient APK (真机 arm64-v8a)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug -PreactNativeArchitectures=arm64-v8a --no-daemon
+
+      - name: 重命名并检查 APK 产物
+        working-directory: android/app/build/outputs/apk/debug/
+        run: |
+          # 兼容不同名字的 APK 产物
+          APK_FILE=$(ls *.apk | head -n 1)
+          mv "$APK_FILE" "${{ env.APK_NAME }}.apk"
+          echo "=== 检查生成的 APK 产物 ==="
+          ls -lh "${{ env.APK_NAME }}.apk"
+
+      - name: 加密构建产物
+        run: |
+          zip -q -P ${{ secrets.ARTIFACT_PASSWORD }} -j ${{ env.APK_NAME }}-Encrypted.zip android/app/build/outputs/apk/debug/${{ env.APK_NAME }}.apk
+
+      - name: 上传加密 APK 到 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: ${{ env.APK_NAME }}-Encrypted.zip
+          retention-days: 7
