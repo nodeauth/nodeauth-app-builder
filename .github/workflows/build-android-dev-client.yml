@@ -1,0 +1,208 @@
+name: Build Android Dev Client APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Git branch to build'
+        required: true
+        default: 'main'
+        type: string
+      version_code:
+        description: '指定 versionCode (可选，建议与 Google Play 内部测试版本对齐；留空则自动按构建号生成)'
+        required: false
+        default: ''
+        type: string
+      architecture:
+        description: '目标 CPU 架构 (arm64-v8a: 现代真机调试首选/构建最快; universal: 全架构通用兼容)'
+        required: true
+        default: 'arm64-v8a'
+        type: choice
+        options:
+          - 'arm64-v8a'
+          - 'universal'
+
+jobs:
+  build:
+    name: Build Android Dev Client APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.MASTER_REPO_PATH }}
+          token: ${{ secrets.MASTER_GITHUB_TOKEN }}
+          ref: ${{ inputs.target_branch }}
+
+      - name: 配置 Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 安装 npm 依赖
+        run: npm ci --legacy-peer-deps
+
+      - name: 原生层 Mock 商店安装来源为 Google Play (支持内购调试)
+        run: |
+          # 关键技术点：Dev Client 是通过 adb 或文件管理器侧载安装，installer 默认为 packageinstaller 或 null。
+          # 为使 Dev Client 在连接 Metro 调试时，无论下发什么 JS 代码都能将安装来源识别为 Google Play，
+          # 精准替换 RNDeviceModule.java 中获取安装器包名的 API 调用，使其直接赋值为 com.android.vending，绝不破坏方法结构与括号。
+          node -e "
+            const fs = require('fs');
+            const file = 'node_modules/react-native-device-info/android/src/main/java/com/learnium/RNDeviceInfo/RNDeviceModule.java';
+            if (fs.existsSync(file)) {
+              let content = fs.readFileSync(file, 'utf8');
+              const target = 'getReactApplicationContext().getPackageManager().getInstallerPackageName(packageName)';
+              if (!content.includes(target)) {
+                console.error('❌ 未找到目标方法调用语句！');
+                process.exit(1);
+              }
+              content = content.replace(target, '\"com.android.vending\"');
+              fs.writeFileSync(file, content, 'utf8');
+              console.log('✅ RNDeviceModule 已成功将 installerPackageName 覆写为 com.android.vending');
+            } else {
+              console.error('⚠️ 未找到 RNDeviceModule.java 文件！');
+              process.exit(1);
+            }
+          "
+
+      - name: 提取版本号与构建信息
+        id: meta
+        run: |
+          VERSION=$(node -p "try { require('./package.json').version } catch(e) { 'unknown' }")
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          DATE=$(date +'%Y%m%d')
+          ARCH="${{ inputs.architecture }}"
+          APK_NAME="NodeAuth-v${VERSION}-${COMMIT_HASH}-${DATE}-${ARCH}-DevClient"
+          echo "APP_VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "APK_NAME=${APK_NAME}" >> $GITHUB_ENV
+          echo "APK 产物名称将设置为: ${APK_NAME}"
+
+      - name: 生成原生 Android 工程 (Prebuild)
+        run: npx expo prebuild --platform android --clean
+
+      - name: 提升 Gradle 运行环境 JVM 堆内存
+        run: |
+          sed -i 's/org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4608m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC/g' android/gradle.properties
+          grep "org.gradle.jvmargs" android/gradle.properties
+
+      - name: 注入指定 VersionCode (对齐 Google Play)
+        if: ${{ inputs.version_code != '' }}
+        run: |
+          TARGET_VC="${{ inputs.version_code }}"
+          echo "正在将 Android versionCode 强制指定为: ${TARGET_VC}"
+          node -e "
+            const fs = require('fs');
+            const file = 'android/app/build.gradle';
+            let content = fs.readFileSync(file, 'utf8');
+            content = content.replace(/versionCode\s+\d+/, 'versionCode ' + process.argv[1]);
+            fs.writeFileSync(file, content, 'utf8');
+            console.log('✅ build.gradle versionCode 已成功更新为 ' + process.argv[1]);
+          " "$TARGET_VC"
+          grep -E "versionCode\s+[0-9]+" android/app/build.gradle
+
+      - name: 配置 Gradle 缓存与运行环境
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: 配置 Android 签名证书 (Keystore)
+        working-directory: android/app
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          # 1. 确保 Secret 存在以防空跑报错
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "Error: ANDROID_KEYSTORE_BASE64 secret is not set!"
+            exit 1
+          fi
+          # 2. 将 base64 字符串解码为真正的 release.keystore 文件
+          echo "$KEYSTORE_BASE64" | base64 --decode > release.keystore
+          echo "Keystore 文件已成功生成在 android/app/release.keystore"
+
+      - name: 重定向 Debug 签名配置至真实证书 (解决 Google Play 内购识别问题)
+        run: |
+          # 关键技术点：AGP 默认将 debug 变体绑定至 androiddebugkey (debug.keystore)。
+          # 此处直接将 signingConfigs.debug 覆写为 release.keystore，并通过 findProperty 与环境变量双重保障注入真实签名。
+          node -e "
+            const fs = require('fs');
+            const file = 'android/app/build.gradle';
+            let content = fs.readFileSync(file, 'utf8');
+            const target = /signingConfigs\s*\{\s*debug\s*\{[\s\S]*?\}\s*\}/;
+            const replacement = \`signingConfigs {
+                debug {
+                    storeFile file('release.keystore')
+                    storePassword findProperty('android.injected.signing.store.password') ?: System.getenv('ANDROID_KEYSTORE_PASSWORD') ?: ''
+                    keyAlias findProperty('android.injected.signing.key.alias') ?: System.getenv('ANDROID_KEY_ALIAS') ?: ''
+                    keyPassword findProperty('android.injected.signing.key.password') ?: System.getenv('ANDROID_KEY_PASSWORD') ?: findProperty('android.injected.signing.store.password') ?: ''
+                }
+            }\`;
+            if (!target.test(content)) {
+              console.error('❌ 未找到 signingConfigs.debug 配置块！');
+              process.exit(1);
+            }
+            content = content.replace(target, replacement);
+            fs.writeFileSync(file, content, 'utf8');
+            console.log('✅ signingConfigs.debug 已成功覆写为 release.keystore');
+          "
+
+      - name: 编译 Debug DevClient APK (打上真实签名以支持 Google Play 内购)
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          if [ "${{ inputs.architecture }}" = "arm64-v8a" ]; then
+            ARCH_FLAGS="-PreactNativeArchitectures=arm64-v8a"
+          else
+            ARCH_FLAGS=""
+          fi
+          ./gradlew assembleDebug $ARCH_FLAGS --no-daemon --stacktrace \
+            -Pandroid.injected.signing.store.file=$(pwd)/app/release.keystore \
+            -Pandroid.injected.signing.store.password=${{ secrets.ANDROID_KEYSTORE_PASSWORD }} \
+            -Pandroid.injected.signing.key.alias=${{ secrets.ANDROID_KEY_ALIAS }} \
+            -Pandroid.injected.signing.key.password=${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: 验证 APK 签名证书指纹与 Google Play 权限
+        working-directory: android/app/build/outputs/apk/debug/
+        run: |
+          # 1. 识别产物并重命名
+          APK_FILE=$(ls *.apk | head -n 1)
+          mv "$APK_FILE" "${{ env.APK_NAME }}.apk"
+          echo "=== 检查生成的 APK 产物 ==="
+          ls -lh "${{ env.APK_NAME }}.apk"
+
+          # 2. 定位并运行 apksigner 验证签名指纹
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
+          if [ -n "$APKSIGNER" ]; then
+            echo "=== 使用 $APKSIGNER 验证 APK 证书指纹 ==="
+            "$APKSIGNER" verify --verbose --print-certs "${{ env.APK_NAME }}.apk"
+          fi
+
+      - name: 加密构建产物
+        run: |
+          zip -q -P ${{ secrets.ARTIFACT_PASSWORD }} -j ${{ env.APK_NAME }}-Encrypted.zip android/app/build/outputs/apk/debug/${{ env.APK_NAME }}.apk
+
+      - name: 上传加密 APK 到 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: ${{ env.APK_NAME }}-Encrypted.zip
+          retention-days: 7
+
+      - name: 强制清理敏感凭据与临时文件
+        if: always()
+        run: |
+          # 1. 彻底物理销毁落盘的 Keystore 签名私钥实体文件
+          rm -f android/app/release.keystore
+          # 2. 清理未加密的原始 APK 产物
+          rm -rf android/app/build/outputs/apk/debug/*.apk
+          echo "✅ 敏感签名凭据与未加密 APK 产物已安全销毁"
