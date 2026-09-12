@@ -1,0 +1,88 @@
+name: Build TrollStore Dev Client IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Git branch to build'
+        required: true
+        default: 'main'
+        type: string
+
+jobs:
+  build:
+    name: Build iOS Dev Client IPA
+    runs-on: macos-latest
+    # runs-on: [self-hosted, macOS, x64]
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.MASTER_REPO_PATH }}
+          token: ${{ secrets.MASTER_GITHUB_TOKEN }}
+          ref: ${{ inputs.target_branch }}
+
+      - name: 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 安装项目依赖
+        run: npm ci --legacy-peer-deps
+
+      - name: 提取版本号与构建信息
+        id: meta
+        run: |
+          VERSION=$(node -p "try { require('./package.json').version } catch(e) { 'unknown' }")
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          DATE=$(date +'%Y%m%d')
+          IPA_NAME="NodeAuth-v${VERSION}-${COMMIT_HASH}-${DATE}-DevClient"
+          echo "IPA_NAME=${IPA_NAME}" >> $GITHUB_ENV
+          echo "IPA 产物名称将设置为: ${IPA_NAME}"
+
+      - name: 生成 iOS 原生工程
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx expo prebuild --platform ios --clean
+
+      - name: 安装 CocoaPods 依赖
+        working-directory: ios
+        run: pod install
+
+      - name: 编译 Debug 开发版二进制 (禁用签名)
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -workspace NodeAuth.xcworkspace \
+            -scheme NodeAuth \
+            -configuration Debug \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -allowProvisioningUpdates \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            clean build
+
+      - name: 封装为巨魔专用的 DevClient.ipa
+        working-directory: ios/build/Build/Products/Debug-iphoneos
+        run: |
+          mkdir -p Payload
+          cp -r NodeAuth.app Payload/
+          zip -q -r $GITHUB_WORKSPACE/${{ env.IPA_NAME }}.ipa Payload
+          echo "=== 检查生成的 IPA 产物 ==="
+          ls -lh $GITHUB_WORKSPACE/${{ env.IPA_NAME }}.ipa
+
+      - name: 加密构建产物
+        run: |
+          zip -q -P ${{ secrets.ARTIFACT_PASSWORD }} -r ${{ env.IPA_NAME }}-Encrypted.zip ${{ env.IPA_NAME }}.ipa
+
+      - name: 上传加密 DevClient IPA 构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: ${{ env.IPA_NAME }}-Encrypted.zip
+          retention-days: 7
