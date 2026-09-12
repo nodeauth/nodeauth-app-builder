@@ -1,0 +1,108 @@
+name: Build Android Dev Client APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Git branch to build'
+        required: true
+        default: 'main'
+        type: string
+
+jobs:
+  build:
+    name: Build Android Dev Client APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.MASTER_REPO_PATH }}
+          token: ${{ secrets.MASTER_GITHUB_TOKEN }}
+          ref: ${{ inputs.target_branch }}
+
+      - name: 配置 Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 安装 npm 依赖
+        run: npm ci --legacy-peer-deps
+
+      - name: 提取版本号与构建信息
+        id: meta
+        run: |
+          VERSION=$(node -p "try { require('./package.json').version } catch(e) { 'unknown' }")
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          DATE=$(date +'%Y%m%d')
+          APK_NAME="NodeAuth-v${VERSION}-${COMMIT_HASH}-${DATE}-DevClient"
+          echo "APK_NAME=${APK_NAME}" >> $GITHUB_ENV
+          echo "APK 产物名称将设置为: ${APK_NAME}"
+
+      - name: 生成原生 Android 工程 (Prebuild)
+        run: npx expo prebuild --platform android --clean
+
+      - name: 配置 Gradle 缓存与运行环境
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: 配置 Android 签名证书 (Keystore)
+        working-directory: android/app
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          # 1. 确保 Secret 存在以防空跑报错
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "Error: ANDROID_KEYSTORE_BASE64 secret is not set!"
+            exit 1
+          fi
+          # 2. 将 base64 字符串解码为真正的 release.keystore 文件
+          echo "$KEYSTORE_BASE64" | base64 --decode > release.keystore
+          echo "Keystore 文件已成功生成在 android/app/release.keystore"
+
+      - name: 编译 Debug DevClient APK (真机 arm64-v8a，打上正式签名)
+        working-directory: android
+        # 注入 Android Gradle Plugin 的全局签名参数，强制覆盖默认的 Debug 签名并打上正式证书
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug -PreactNativeArchitectures=arm64-v8a --no-daemon \
+            -Pandroid.injected.signing.store.file=$(pwd)/app/release.keystore \
+            -Pandroid.injected.signing.store.password=${{ secrets.ANDROID_KEYSTORE_PASSWORD }} \
+            -Pandroid.injected.signing.key.alias=${{ secrets.ANDROID_KEY_ALIAS }} \
+            -Pandroid.injected.signing.key.password=${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: 重命名并检查 APK 产物
+        working-directory: android/app/build/outputs/apk/debug/
+        run: |
+          # 兼容不同名字的 APK 产物
+          APK_FILE=$(ls *.apk | head -n 1)
+          mv "$APK_FILE" "${{ env.APK_NAME }}.apk"
+          echo "=== 检查生成的 APK 产物 ==="
+          ls -lh "${{ env.APK_NAME }}.apk"
+
+      - name: 加密构建产物
+        run: |
+          zip -q -P ${{ secrets.ARTIFACT_PASSWORD }} -j ${{ env.APK_NAME }}-Encrypted.zip android/app/build/outputs/apk/debug/${{ env.APK_NAME }}.apk
+
+      - name: 上传加密 APK 到 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: ${{ env.APK_NAME }}-Encrypted.zip
+          retention-days: 7
+
+      - name: 强制清理敏感凭据与临时文件
+        if: always()
+        run: |
+          # 1. 彻底物理销毁落盘的 Keystore 签名私钥实体文件
+          rm -f android/app/release.keystore
+          # 2. 清理未加密的原始 APK 产物
+          rm -rf android/app/build/outputs/apk/debug/*.apk
+          echo "✅ 敏感签名凭据与未加密 APK 产物已安全销毁"

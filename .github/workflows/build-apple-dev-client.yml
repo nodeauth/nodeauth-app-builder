@@ -1,0 +1,68 @@
+name: Build Apple Dev Client IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Git branch to build'
+        required: true
+        default: 'main'
+        type: string
+
+jobs:
+  build:
+    name: Build iOS Dev Client IPA
+    runs-on: macos-latest
+    
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.MASTER_REPO_PATH }}
+          token: ${{ secrets.MASTER_GITHUB_TOKEN }}
+          ref: ${{ inputs.target_branch }}
+
+      - name: 配置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Setup Expo
+        uses: expo/expo-github-action@v8
+        with:
+          expo-version: latest
+          eas-version: latest
+          packager: npm
+          token: ${{ secrets.EXPO_ACCESS_TOKEN }}
+
+      - name: 安装项目依赖
+        run: npm ci --legacy-peer-deps
+
+      - name: 提取版本号与构建信息
+        id: meta
+        run: |
+          VERSION=$(node -p "try { require('./package.json').version } catch(e) { 'unknown' }")
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          DATE=$(date +'%Y%m%d')
+          IPA_NAME="NodeAuth-v${VERSION}-${COMMIT_HASH}-${DATE}-DevClient"
+          echo "IPA_NAME=${IPA_NAME}" >> $GITHUB_ENV
+          echo "IPA 产物名称将设置为: ${IPA_NAME}"
+
+      - name: Local Build Development Client
+        env:
+          EXPO_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          EXPO_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          eas build --platform ios --profile development --local --output $GITHUB_WORKSPACE/${{ env.IPA_NAME }}.ipa --non-interactive
+
+      - name: 加密构建产物
+        run: |
+          zip -q -P ${{ secrets.ARTIFACT_PASSWORD }} -r ${{ env.IPA_NAME }}-Encrypted.zip ${{ env.IPA_NAME }}.ipa
+
+      - name: 上传加密 DevClient IPA 构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: ${{ env.IPA_NAME }}-Encrypted.zip
+          retention-days: 7

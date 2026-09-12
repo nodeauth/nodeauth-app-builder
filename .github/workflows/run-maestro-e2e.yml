@@ -1,0 +1,85 @@
+name: Maestro E2E Tests (iOS Simulator)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Git branch to build and test'
+        required: true
+        default: 'main'
+        type: string
+
+jobs:
+  e2e-test:
+    name: Run Maestro E2E on iOS
+    runs-on: macos-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.MASTER_REPO_PATH }}
+          token: ${{ secrets.MASTER_GITHUB_TOKEN }}
+          ref: ${{ inputs.target_branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Prebuild iOS
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Install CocoaPods
+        working-directory: ios
+        run: pod install
+
+      - name: Build App for iOS Simulator
+        working-directory: ios
+        # 针对模拟器必须使用 iphonesimulator SDK，并且不需要物理证书签名
+        run: |
+          xcodebuild \
+            -workspace NodeAuth.xcworkspace \
+            -scheme NodeAuth \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Install Maestro
+        run: |
+          curl -Ls "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> $GITHUB_PATH
+
+      - name: Boot iOS Simulator
+        run: |
+          # 启动一台可用的 iPhone 模拟器（此处以 iPhone 15 为例，macOS-latest 通常包含较新的 iOS runtime）
+          xcrun simctl boot "iPhone 15" || true
+          # 等待模拟器完全启动
+          xcrun simctl bootstatus "iPhone 15" -b
+
+      - name: Install App on Simulator
+        working-directory: ios/build/Build/Products/Debug-iphonesimulator
+        run: |
+          # 将刚才编译好的 .app 安装到已启动的模拟器中
+          xcrun simctl install booted NodeAuth.app
+
+      - name: Run Maestro Tests
+        run: |
+          # 假设你在项目根目录建了 .maestro/ 文件夹来存放 YAML 测试用例
+          # 如果没有用例，这条命令会报错，所以我们在真实运行时需要确保有 yaml 文件
+          maestro test .maestro/
+
+      - name: Upload Maestro Reports (On Failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maestro-debug-reports
+          # Maestro 会把报错时的截屏、层级树生成到这里
+          path: ~/.maestro/tests/**/*
+          retention-days: 3
